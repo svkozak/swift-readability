@@ -6,7 +6,19 @@ import WebKit
 /// This class uses a WKWebView to load HTML and execute JavaScript for parsing.
 @MainActor
 final class ReadabilityRunner {
+    private static let networkBlockerIdentifier = "swift-readability.block-all-network-v1"
+    private static let networkBlockerSource = """
+        [
+          {
+            "trigger": { "url-filter": ".*" },
+            "action": { "type": "block" }
+          }
+        ]
+        """
+    private static var networkBlocker: WKContentRuleList?
+
     private let webView: WKWebView
+    private var isNetworkBlockerInstalled = false
 
     // The message handler that listens for events from the injected JavaScript.
     private weak var messageHandler: ReadabilityMessageHandler<EmptyContentGenerator>?
@@ -17,6 +29,7 @@ final class ReadabilityRunner {
 
     init() {
         let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
         let messageHandler = ReadabilityMessageHandler(
             mode: .generateReadabilityResult,
             readerContentGenerator: EmptyContentGenerator()
@@ -33,8 +46,11 @@ final class ReadabilityRunner {
         options: Readability.Options?,
         baseURL: URL? = nil
     ) async throws -> ReadabilityResult {
+        try await installNetworkBlocker()
+
         let shouldSanitize = options?.shouldSanitize ?? false
-        let script = try await scriptLoader
+        let script =
+            try await scriptLoader
             .load(shouldSanitize ? .readabilitySanitized : .readabilityBasic)
             .replacingOccurrences(
                 of: "__READABILITY_OPTION__",
@@ -50,22 +66,52 @@ final class ReadabilityRunner {
         webView.configuration.userContentController.addUserScript(endScript)
         webView.loadHTMLString(html, baseURL: baseURL)
 
-        return try await withCheckedThrowingContinuation { [weak self] continuation in
-            self?.messageHandler?.subscribeEvent { event in
-                switch event {
-                case let .contentParsed(readabilityResult):
-                    continuation.resume(returning: readabilityResult)
-                    self?.messageHandler?.subscribeEvent(nil)
-                case let .availabilityChanged(availability):
-                    if availability == .unavailable {
-                        continuation.resume(throwing: Error.readerIsUnavailable)
+        do {
+            let result = try await withCheckedThrowingContinuation { [weak self] continuation in
+                self?.messageHandler?.subscribeEvent { event in
+                    switch event {
+                    case let .contentParsed(readabilityResult):
+                        continuation.resume(returning: readabilityResult)
                         self?.messageHandler?.subscribeEvent(nil)
+                    case let .availabilityChanged(availability):
+                        if availability == .unavailable {
+                            continuation.resume(throwing: Error.readerIsUnavailable)
+                            self?.messageHandler?.subscribeEvent(nil)
+                        }
+                    default:
+                        break
                     }
-                default:
-                    break
                 }
             }
+            webView.stopLoading()
+            return result
+        } catch {
+            webView.stopLoading()
+            throw error
         }
+    }
+
+    private func installNetworkBlocker() async throws {
+        guard !isNetworkBlockerInstalled else { return }
+
+        let blocker: WKContentRuleList
+        if let networkBlocker = Self.networkBlocker {
+            blocker = networkBlocker
+        } else {
+            guard
+                let compiledBlocker = try await WKContentRuleListStore.default().compileContentRuleList(
+                    forIdentifier: Self.networkBlockerIdentifier,
+                    encodedContentRuleList: Self.networkBlockerSource
+                )
+            else {
+                throw Error.networkBlockerUnavailable
+            }
+            blocker = compiledBlocker
+            Self.networkBlocker = blocker
+        }
+
+        webView.configuration.userContentController.add(blocker)
+        isNetworkBlockerInstalled = true
     }
 }
 
@@ -85,6 +131,8 @@ extension ReadabilityRunner {
     enum Error: Swift.Error {
         /// Indicates that the reader became unavailable during parsing.
         case readerIsUnavailable
+        /// Indicates that WebKit could not create the rule that blocks network requests.
+        case networkBlockerUnavailable
     }
 }
 
